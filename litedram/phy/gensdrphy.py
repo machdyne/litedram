@@ -3,9 +3,10 @@
 #
 # Copyright (c) 2012-2020 Florent Kermarrec <florent@enjoy-digital.fr>
 # Copyright (c) 2020 Antmicro <www.antmicro.com>
+# Copyright (c) 2022 Lone Dynamics <info@lonedynamics.com>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# 1:1, 1:2 frequency-ratio Generic SDR PHY
+# 1:1, 1:2, 1:4 frequency-ratio Generic SDR PHY
 
 from migen import *
 
@@ -158,3 +159,101 @@ class HalfRateGENSDRPHY(Module):
             dfi.phases[1].rddata.eq(full_rate_phy.dfi.phases[0].rddata),
             dfi.phases[1].rddata_valid.eq(full_rate_phy.dfi.phases[0].rddata_valid),
         ]
+
+# Quarter-rate Generic SDR PHY ------------------------------------------------------------------------
+
+class QuarterRateGENSDRPHY(Module):
+    def __init__(self, pads, sys_clk_freq=100e6, cl=None):
+        pads        = PHYPadsCombiner(pads)
+        addressbits = len(pads.a)
+        bankbits    = len(pads.ba)
+        nranks      = 1 if not hasattr(pads, "cs_n") else len(pads.cs_n)
+        databits    = len(pads.dq)
+        nphases     = 4
+
+        # Parameters -------------------------------------------------------------------------------
+        cl = get_default_cl(memtype="SDR", tck=1/sys_clk_freq) if cl is None else cl
+
+        # HalfRate PHY -----------------------------------------------------------------------------
+        half_rate_phy = HalfRateGENSDRPHY(pads, 2*sys_clk_freq, cl)
+        self.submodules += ClockDomainsRenamer("sys4x")(half_rate_phy)
+
+        # PHY settings -----------------------------------------------------------------------------
+        self.settings = PhySettings(
+            phytype       = "QuarterRateGENSDRPHY",
+            memtype       = "SDR",
+            databits      = databits,
+            dfi_databits  = 2*databits,
+            nranks        = nranks,
+            nphases       = nphases,
+            rdphase       = 0,
+            wrphase       = 1,
+            cl            = cl,
+            read_latency  = half_rate_phy.settings.read_latency//2 + 1,
+            write_latency = 0
+        )
+
+        # DFI adaptation ---------------------------------------------------------------------------
+        self.dfi = dfi = Interface(addressbits, bankbits, nranks, databits, nphases)
+
+        # Clocking ---------------------------------------------------------------------------------
+        sd_sys = getattr(self.sync, "sys")
+        sd_sys4x = getattr(self.sync, "sys4x")
+
+        # select active sys2x phase
+        # sys_clk   ----____----____
+        # sys2x     --__--__--__--__
+        # sys4x     -_-_-_-_-_-_-_-_
+        # phase_sel 0   1   0   1
+        phase_sel = Signal()
+        phase_sys4x = Signal.like(phase_sel)
+        phase_sys = Signal.like(phase_sys4x)
+
+        sd_sys += phase_sys.eq(phase_sys4x)
+
+        sd_sys4x += [
+            If(phase_sys4x == phase_sys,
+                phase_sel.eq(0),
+            ).Else(
+                phase_sel.eq(~phase_sel)
+            ),
+            phase_sys4x.eq(~phase_sel)
+        ]
+
+        dfi_omit = set(["rddata", "rddata_valid", "wrdata_en"])
+        self.comb += [
+            If(~phase_sel,
+                dfi.phases[0].connect(half_rate_phy.dfi.phases[0], omit=dfi_omit),
+                dfi.phases[1].connect(half_rate_phy.dfi.phases[1], omit=dfi_omit),
+            ).Else(
+                dfi.phases[2].connect(half_rate_phy.dfi.phases[0], omit=dfi_omit),
+                dfi.phases[3].connect(half_rate_phy.dfi.phases[1], omit=dfi_omit),
+            ),
+        ]
+
+        wr_data_en = dfi.phases[self.settings.wrphase].wrdata_en & ~phase_sel
+        wr_data_en_d = Signal()
+        sd_sys4x += wr_data_en_d.eq(wr_data_en)
+        self.comb += half_rate_phy.dfi.phases[half_rate_phy.settings.wrphase].wrdata_en.eq(wr_data_en | wr_data_en_d)
+
+        # Reads
+        rddata = Array(Signal(2*databits) for i in range(2))
+        rddata_valid = Signal(2)
+
+        for i in range(2):
+            sd_sys4x += [
+                rddata_valid[i].eq(half_rate_phy.dfi.phases[i].rddata_valid),
+                rddata[i].eq(half_rate_phy.dfi.phases[i].rddata)
+            ]
+
+        sd_sys += [
+            dfi.phases[0].rddata.eq(rddata[0]),
+            dfi.phases[0].rddata_valid.eq(rddata_valid[0]),
+            dfi.phases[1].rddata.eq(rddata[1]),
+            dfi.phases[1].rddata_valid.eq(rddata_valid[1]),
+            dfi.phases[2].rddata.eq(half_rate_phy.dfi.phases[0].rddata),
+            dfi.phases[2].rddata_valid.eq(half_rate_phy.dfi.phases[0].rddata_valid),
+            dfi.phases[3].rddata.eq(half_rate_phy.dfi.phases[1].rddata),
+            dfi.phases[3].rddata_valid.eq(half_rate_phy.dfi.phases[1].rddata_valid)
+        ]
+
